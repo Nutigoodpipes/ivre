@@ -32,8 +32,8 @@ from future.utils import PY3
 
 from sqlalchemy import event, func, Column, ForeignKey, Index, DateTime, \
     Float, Integer, LargeBinary, String, Text, ForeignKeyConstraint
-from sqlalchemy.dialects import postgresql
-from sqlalchemy.types import UserDefinedType, TypeDecorator
+from sqlalchemy.dialects import postgresql, sqlite
+from sqlalchemy.types import UserDefinedType, TypeDecorator, ARRAY, JSON
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.sql.operators import custom_op, json_getitem_op
 from sqlalchemy.sql.expression import BinaryExpression
@@ -84,7 +84,7 @@ def sqlite_engine_connect(dbapi_connection, connection_record):
     dbapi_connection.create_function('ACCESS', 2, access)
 
     def access_astext(d, k):
-        return str(json.loads(d).get(k))
+        return json.dumps(json.loads(d).get(k), sort_keys=True)
 
     dbapi_connection.create_function('ACCESS_TXT', 2, access_astext)
 
@@ -109,68 +109,18 @@ def extend_binary_expression(element, compiler, **kwargs):
                                                     element.right))
         if opstring == '?':
             return compiler.process(func.HAS_KEY(element.left, element.right))
-    # FIXME: Variant base type Comparator seems to be used here.
-    if element.operator == json_getitem_op:
-        return compiler.process(func.ACCESS(element.left, element.right))
     return compiler.visit_binary(element)
 
 
 # Types
 
-class DefaultJSONB(UserDefinedType):
 
-    python_type = dict
-
-    def __init__(self):
-        self.__visit_name__ = "DefaultJSONB"
-
-    def get_col_spec(self):
-        return self.__visit_name__
-
-    @staticmethod
-    def bind_processor(dialect):
-        def process(value):
-            if value is not None:
-                value = json.dumps(value, sort_keys=True)
-            return value
-        return process
-
-    @staticmethod
-    def result_processor(dialect, coltype):
-        def process(value):
-            if value is not None:
-                value = json.loads(value)
-            return value
-        return process
-
-
-SQLJSONB = postgresql.JSONB().with_variant(DefaultJSONB(), "sqlite")
-
-
-class DefaultARRAY(TypeDecorator):
-
-    impl = Text
-
-    def __init__(self, item_type, *args, **kwargs):
-        TypeDecorator.__init__(self, *args, **kwargs)
-        self.item_type = item_type
-
-    @staticmethod
-    def process_bind_param(value, dialect):
-        if value is not None:
-            value = json.dumps(value, sort_keys=True)
-        return value
-
-    @staticmethod
-    def process_result_value(value, dialect):
-        if value is not None:
-            value = json.loads(value)
-        return value
+SQLJSONB = postgresql.JSONB().with_variant(sqlite.JSON(), "sqlite")
 
 
 def SQLARRAY(item_type):
-    return postgresql.ARRAY(item_type)\
-        .with_variant(DefaultARRAY(item_type), "sqlite")
+    return ARRAY(item_type)\
+        .with_variant(postgresql.ARRAY(item_type), "postgresql")
 
 
 class DefaultINET(UserDefinedType):

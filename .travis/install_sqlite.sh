@@ -19,4 +19,6 @@
 mkdir -p /tmp/ivredb
 sudo mount -t tmpfs tmpfs /tmp/ivredb -o users,uid=travis,gid=travis,mode=0777
 
+sqlite3	--version
+
 echo 'DB = "sqlite:////tmp/ivredb/ivre.db"' >> ~/.ivre.conf
