@@ -145,6 +145,8 @@ def disp_recs_json(flt, sort, limit, skip):
                 pass
         if rec.get('recontype') == 'SSL_SERVER' and \
            rec.get('source') == 'cert':
+            if not isinstance(rec['value'], bytes):
+                rec['value'] = bytes(rec['value'], encoding='utf-8')
             rec['value'] = utils.encode_b64(rec['value']).decode()
         print(json.dumps(rec, indent=indent, default=db.passive.serialize))
 

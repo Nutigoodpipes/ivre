@@ -2324,6 +2324,7 @@ class DBPassive(DB):
     list_fields = ["infos.domain",
                    "infos.domaintarget",
                    "infos.san"]
+    datetime_fields = ["firstseen", "lastseen"]
 
     def __init__(self):
         super(DBPassive, self).__init__()
@@ -3502,6 +3503,7 @@ class MetaDB(object):
             "tinydb": ("tiny", "TinyDBNmap"),
         },
         "passive": {
+            "elastic" : ("elastic", "ElasticDBPassive"),
             "mongodb": ("mongo", "MongoDBPassive"),
             "postgresql": ("sql.postgres", "PostgresDBPassive"),
             "sqlite": ("sql.sqlite", "SqliteDBPassive"),

@@ -659,7 +659,8 @@ which `predicate()` is True, given `webflt`.
 purposes to feed Elasticsearch view.
 
         """
-        if DATABASE != "elastic":
+        # FIXME : Ensure proper tests for passive here.
+        if DATABASE != "elastico":
             return
         subprocess.check_call(["mongorestore", "--db", "ivre", "../backup/"])
 
@@ -1630,6 +1631,13 @@ purposes to feed Elasticsearch view.
 
         run_passiverecon_worker(bulk_mode=bulk_mode)
 
+        if DATABASE == 'elastic':
+            # We need to force flush for elastic, because results may not be
+            # properly inserted when counting
+            print("[DBG] FLUSHING")
+            ivre.db.db.passive.flush()
+            time.sleep(1)
+
         # Counting
         total_count = ivre.db.db.passive.count(
             ivre.db.db.passive.flt_empty
@@ -2196,6 +2204,8 @@ purposes to feed Elasticsearch view.
         port = 0
         for line in out.decode().splitlines():
             nport = json.loads(line).get('port', 0)
+            print("[DBG] nport = %r" % nport)
+            print("[DBG] port = %r" % port)
             self.assertTrue(port <= nport)
             port = nport
         res, out, err = RUN(["ivre", "ipinfo", "--json", "--sort", "~port"])

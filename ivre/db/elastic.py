@@ -22,21 +22,25 @@ databases.
 
 """
 
+
+import datetime
+import hashlib
 import json
 import re
 try:
     from urllib.parse import unquote
 except ImportError:
     from urllib import unquote
+import sys
 
 
 from elasticsearch import Elasticsearch, helpers
-from elasticsearch_dsl import Q
+from elasticsearch_dsl import A, Q, Search
 from elasticsearch_dsl.query import Query
 from future.utils import viewitems
 from past.builtins import basestring
 
-from ivre.db import DB, DBActive, DBView
+from ivre.db import DB, DBActive, DBPassive, DBView
 from ivre import utils, xmlnmap
 
 
@@ -45,6 +49,7 @@ PAGESIZE = 250
 
 class ElasticDB(DB):
 
+    no_limit = 0
     nested_fields = []
 
     # filters
@@ -186,6 +191,99 @@ class ElasticDB(DB):
     def flt2str(flt):
         return json.dumps(flt.to_dict())
 
+    def flush(self):
+        for ix in self.indexes:
+            self.db_client.indices.flush(index=ix)
+
+    def get(self, spec, fields=None, **kargs):
+        """Queries the active index."""
+        query = {"query": spec.to_dict()}
+        if "sort" in kargs:
+            query["sort"] = []
+            for crit in kargs["sort"]:
+                query["sort"].append(
+                    {crit[0]: "asc" if crit[1] == -1 else "desc"}
+                )
+        if fields is not None:
+            query['_source'] = fields
+        # if "limit" in kargs and kargs["limit"] > 0:
+        #     query["size"] = kargs["limit"]
+        # if "skip" in kargs and kargs["skip"] > 0:
+        #     query["from"] = kargs["skip"]
+        counter = kargs.get("limit", 0)
+        skip = kargs.get("skip", 0)
+        for rec in helpers.scan(self.db_client,
+                                query=query,
+                                index=self.indexes[0],
+                                ignore_unavailable=True):
+            # FIXME : Idem than below, but with performance issues !!
+            if skip > 0:
+                skip -= 1
+                continue
+            host = dict(rec['_source'], _id=rec['_id'])
+            if 'coordinates' in host.get('infos', {}):
+                host['infos']['coordinates'] = host['infos'][
+                    'coordinates'
+                ][::-1]
+            for field in self.datetime_fields:
+                if field in host:
+                    host[field] = utils.all2datetime(host[field])
+            yield host
+            # FIXME : the 'size' parameter do not seems to work as intended,
+            # workaround is a local counter. (0 means no limit)
+            counter -= 1
+            if counter == 0:
+                break
+
+    def get_one(self, spec, fields=None, **kwargs):
+        try:
+            return next(self.get(spec, fields=fields, limit=1, **kwargs))
+        except StopIteration:
+            return None
+
+    def distinct(self, field, flt=None, sort=None, limit=None, skip=None):
+        if flt is None:
+            flt = self.flt_empty
+        if field == 'infos.coordinates':
+            def fix_result(value):
+                return tuple(float(v) for v in value.split(', '))
+            base_query = {"script": {
+                "lang": "painless",
+                "source": "doc['infos.coordinates'].value",
+            }}
+            flt = self.flt_and(flt, self.searchhaslocation())
+        else:
+            base_query = {"field": field}
+            if field in self.datetime_fields:
+                def fix_result(value):
+                    return utils.all2datetime(value / 1000)
+            else:
+                def fix_result(value):
+                    return value
+        # https://techoverflow.net/2019/03/17/how-to-query-distinct-field-values-in-elasticsearch/
+        query = {"size": PAGESIZE,
+                 "sources": [{field: {"terms": base_query}}]}
+        while True:
+            result = self.db_client.search(
+                body={"query": flt.to_dict(),
+                      "aggs": {"values": {"composite": query}}},
+                index=self.indexes[0],
+                ignore_unavailable=True,
+                size=0
+            )
+            for value in result["aggregations"]["values"]["buckets"]:
+                yield fix_result(value['key'][field])
+            if 'after_key' not in result["aggregations"]["values"]:
+                break
+            query["after"] = result["aggregations"]["values"]["after_key"]
+
+    def count(self, flt):
+        return self.db_client.count(
+            body={"query": flt.to_dict()},
+            index=self.indexes[0],
+            ignore_unavailable=True,
+        )['count']
+
 
 def _create_mappings(nested, all_mappings):
     res = {}
@@ -257,32 +355,6 @@ class ElasticDBActive(ElasticDB, DBActive):
         self.db_client.index(index=self.indexes[0],
                              body=host)
 
-    def count(self, flt):
-        return self.db_client.count(
-            body={"query": flt.to_dict()},
-            index=self.indexes[0],
-            ignore_unavailable=True,
-        )['count']
-
-    def get(self, spec, fields=None, **kargs):
-        """Queries the active index."""
-        query = {"query": spec.to_dict()}
-        if fields is not None:
-            query['_source'] = fields
-        for rec in helpers.scan(self.db_client,
-                                query=query,
-                                index=self.indexes[0],
-                                ignore_unavailable=True):
-            host = dict(rec['_source'], _id=rec['_id'])
-            if 'coordinates' in host.get('infos', {}):
-                host['infos']['coordinates'] = host['infos'][
-                    'coordinates'
-                ][::-1]
-            for field in self.datetime_fields:
-                if field in host:
-                    host[field] = utils.all2datetime(host[field])
-            yield host
-
     def remove(self, host):
         """Removes the host from the active column. `host` must be the record as
         returned by .get().
@@ -292,42 +364,6 @@ class ElasticDBActive(ElasticDB, DBActive):
             id=host['_id'],
             index=self.indexes[0],
         )
-
-    def distinct(self, field, flt=None, sort=None, limit=None, skip=None):
-        if flt is None:
-            flt = self.flt_empty
-        if field == 'infos.coordinates':
-            def fix_result(value):
-                return tuple(float(v) for v in value.split(', '))
-            base_query = {"script": {
-                "lang": "painless",
-                "source": "doc['infos.coordinates'].value",
-            }}
-            flt = self.flt_and(flt, self.searchhaslocation())
-        else:
-            base_query = {"field": field}
-            if field in self.datetime_fields:
-                def fix_result(value):
-                    return utils.all2datetime(value / 1000)
-            else:
-                def fix_result(value):
-                    return value
-        # https://techoverflow.net/2019/03/17/how-to-query-distinct-field-values-in-elasticsearch/
-        query = {"size": PAGESIZE,
-                 "sources": [{field: {"terms": base_query}}]}
-        while True:
-            result = self.db_client.search(
-                body={"query": flt.to_dict(),
-                      "aggs": {"values": {"composite": query}}},
-                index=self.indexes[0],
-                ignore_unavailable=True,
-                size=0
-            )
-            for value in result["aggregations"]["values"]["buckets"]:
-                yield fix_result(value['key'][field])
-            if 'after_key' not in result["aggregations"]["values"]:
-                break
-            query["after"] = result["aggregations"]["values"]["after_key"]
 
     def getlocations(self, flt):
         query = {"size": PAGESIZE,
@@ -1137,3 +1173,385 @@ class ElasticDBView(ElasticDBActive, DBView):
     def store_or_merge_host(self, host):
         if not self.merge_host(host):
             self.store_host(host)
+
+
+class ElasticDBPassive(ElasticDB, DBPassive):
+
+    nested_fields = [
+        "infos",
+    ]
+    mappings = [
+        _create_mappings(
+            nested_fields,
+            [
+                ("nested", nested_fields),
+                ("ip", DBPassive.ipaddr_fields),
+                ("date", DBPassive.datetime_fields),
+                ("geo_point", ["infos.coordinates"]),
+            ]
+        ),
+    ]
+    index_hosts = 0
+
+    def __init__(self, url):
+        super(ElasticDBPassive, self).__init__(url)
+        self.indexes = ["%s%s" % (self.index_prefix,
+                                  self.params.pop('indexname_hosts', 'passive'))]
+
+    def get(self, spec, fields=None, **kargs):
+        """Queries the active index."""
+        req = Search(index=self.indexes[0]).using(self.db_client)
+        if fields is not None:
+            req = req.source(fields)
+        req = req.query(spec)
+        if "sort" in kargs:
+            sortlist = []
+            for crit in kargs["sort"]:
+                sortlist.append(
+                    {crit[0]: {"order": "asc" if crit[1] == 1 else "desc"}}
+                )
+            req = req.sort(*sortlist)
+        if "limit" in kargs and kargs["limit"] > 0:
+            limit = kargs["limit"]
+            if "skip" in kargs and kargs["skip"] > 0:
+                skip = kargs["skip"]
+                req = req[skip:skip+limit]
+            else:
+                req = req[:limit]
+        elif "skip" in kargs and kargs["skip"] > 0:
+            req = req[kargs["skip"]:]
+        for rec in req.execute():
+            host = rec.to_dict()
+            if 'coordinates' in host.get('infos', {}):
+                host['infos']['coordinates'] = host['infos'][
+                    'coordinates'
+                ][::-1]
+            for field in self.datetime_fields:
+                if field in host:
+                    host[field] = utils.all2datetime(host[field])
+            yield host
+
+    def store_host(self, host):
+        if 'coordinates' in host.get('infos', {}):
+            host['infos']['coordinates'] = host['infos']['coordinates'][::-1]
+        self.db_client.index(index=self.indexes[0],
+                             body=host)
+
+    def insert_or_update(self, timestamp, spec, getinfos=None, lastseen=None):
+        host = spec
+        if getinfos is not None:
+            infos = getinfos(spec)
+            if "infos" in infos:
+                host["infos"] = infos["infos"]
+        host["firstseen"] = timestamp
+        host["lastseen"] = lastseen if lastseen is not None else timestamp
+        if not "count" in host:
+            host["count"] = 1
+        if not "port" in host:
+            host["port"] = 0
+        hostid = ""
+        for f in ["addr", "sensor", "recontype", "source", "targetval",
+                  "value"]:
+            if f in host:
+                hostid += host[f]
+            hostid += "-"
+        hostid = hashlib.sha256(bytes(hostid, encoding="utf8")).hexdigest()
+        if len(hostid) > 512:
+            utils.LOGGER.warning("Elasticsearch document ID overlength (512B)")
+        updt_response = self.db_client.update(
+            index=self.indexes[0],
+            id=hostid,
+            body={
+                "script": {
+                    # TODO : Also update firstseen and lastseen !
+                    "source": """
+                        ctx._source.count += %d ;
+                    """ % host["count"],
+                    "params": host,
+                },
+                "upsert": host,
+            }
+        )
+
+    @classmethod
+    def searchmac(cls, mac=None, neg=False):
+        req = Q("match", **{"recontype": "MAC_ADDRESS"})
+        if mac is not None:
+            if isinstance(mac, re.Pattern):
+                req &= Q("regexp", **{"value": cls._get_pattern(mac)})
+            else:
+                req &= Q("match", **{"value": mac})
+        if neg:
+            return ~req
+        return req
+
+    @classmethod
+    def searchsensor(cls, sensor, neg=False):
+        if isinstance(sensor, re.Pattern):
+            req = Q("regexp", **{ "sensor": cls._get_pattern(sensor) })
+        else:
+            req = Q("match", **{ "sensor": sensor })
+        if neg:
+            return ~req
+        return req
+
+    @staticmethod
+    def searchrange(start, stop, neg=False):
+        req = Q("bool", **{
+            "must": {
+                "range": {
+                    "addr": { "gte": start, "lte": stop }
+                }
+            }
+        })
+        if neg:
+            return ~req
+        return req
+
+    @classmethod
+    def searchcertsubject(cls, expr, issuer=None, neg=False):
+        req = Q("match", **{"recontype": "SSL_SERVER"})
+        req &= Q("match", **{"source": "cert"})
+        if isinstance(expr, re.Pattern):
+            req &= Q("regexp", **{"infos.subject_text": cls._get_pattern(expr)})
+        else:
+            req &= Q("match", **{"infos.subject_text": expr})
+        if issuer is not None:
+            if isinstance(issuer, re.Pattern):
+                req &= Q("regexp", **{
+                    "infos.subject_issuer": cls._get_pattern(issuer)
+                })
+            else:
+                req &= Q("match", **{"infos.subject_issuer": issuer})
+        if neg:
+            return ~req
+        return req
+
+    @classmethod
+    def searchuseragent(cls, useragent=None, neg=False):
+        req = Q("match", **{"recontype": "HTTP_CLIENT_HEADER"})
+        req &= Q("match", **{"source": "USER-AGENT"})
+        if useragent is not None:
+            if isinstance(useragent, re.Pattern):
+                req &= Q("regexp", **{ "value": cls._get_pattern(useragent) })
+            else:
+                req &= Q("match", **{ "value": useragent })
+        if neg:
+            return ~req
+        return req
+
+    @staticmethod
+    def searchbasicauth():
+        req = Q("bool", must=[
+            { "bool": { "should": [
+                { "term": { "recontype": "HTTP_CLIENT_HEADER" }},
+                { "term": { "recontype": "HTTP_CLIENT_HEADER_SERVER" }},
+            ]}},
+            { "bool": { "should": [
+                { "term": { "source": "AUTHORIZATION" }},
+                { "term": { "source": "PROXY-AUTHORIZATION" }},
+            ]}},
+        ])
+        req &= Q("regexp", **{ "value": "Basic.*" })
+        return req
+
+    @staticmethod
+    def searchhttpauth():
+        return Q("bool", must=[
+            { "bool": { "should": [
+                { "term": { "recontype": "HTTP_CLIENT_HEADER" }},
+                { "term": { "recontype": "HTTP_CLIENT_HEADER_SERVER" }},
+            ]}},
+            { "bool": { "should": [
+                { "term": { "source": "AUTHORIZATION" }},
+                { "term": { "source": "PROXY-AUTHORIZATION" }},
+            ]}},
+        ])
+
+    @staticmethod
+    def searchftpauth():
+        return Q("bool", should =[
+            { "term": { "recontype": "FTP_CLIENT" }},
+            { "term": { "recontype": "FTP_SERVER" }},
+        ])
+
+    @staticmethod
+    def searchpopauth():
+        return Q("bool", should =[
+            { "term": { "recontype": "POP_CLIENT" }},
+            { "term": { "recontype": "POP_SERVER" }},
+        ])
+    
+    @staticmethod
+    def searchport(port, protocol='tcp', state='open', neg=False):
+        if protocol != 'tcp':
+            raise ValueError("Protocols other than TCP are not supported "
+                             "in passive")
+        if state != 'open':
+            raise ValueError("Only open ports can be found in passive")
+        if neg:
+            return ~Q("match", **{'port': port})
+        else:
+            return Q("match", **{'port': port})
+
+    @classmethod
+    def searchservice(cls, srv=None, port=None, protocol="tcp", version=None):
+        """Search a port with a particular service."""
+        req = cls.flt_empty
+        if srv is not None:
+            req &= Q("match", **{"infos.service_name": srv})
+        if port is not None:
+            req &= Q("match", **{"port": port})
+        if version is not None:
+            req &= Q("match", **{"infos.service_version": version})
+        if protocol != "tcp":
+            raise ValueError("Protocols other than TCP are not supported "
+                             "in passive")
+        return req
+
+    @classmethod
+    def searchproduct(cls, product=None, version=None, service=None, port=None,
+                      protocol="tcp"):
+        """Search a port with a particular `product`. It is (much)
+        better to provide the `service` name and/or `port` number
+        since those fields are indexed.
+
+        """
+        req = cls.searchservice(service, port=port, protocol=protocol,
+                                version=version)
+        if product is not None:
+            req &= Q("match", **{"infos.service_product": product})
+        return req
+
+    @staticmethod
+    def searchtimeago(delta, neg=False, new=True):
+        if not isinstance(delta, datetime.timedelta):
+            delta = datetime.timedelta(seconds=delta)
+        return Q("bool", must={ "range": {
+            "firstseen" if new else "lastseen": {
+                "lte" if neg else "gte" : datetime.datetime.now() - delta
+            }
+        }})
+
+    @staticmethod
+    def searchnewer(timestamp, neg=False, new=True):
+        if not isinstance(timestamp, datetime.datetime):
+            timestamp = datetime.datetime.fromtimestamp(timestamp)
+        return Q("bool", must={ "range": {
+            "firstseen" if new else "lastseen": {
+                "lte" if neg else "gte": timestamp
+            }
+        }})
+
+    @classmethod
+    def _searchja3(cls, value_or_hash=None):
+        if value_or_hash is None:
+            return Q()
+        key, value = cls._ja3keyvalue(value_or_hash)
+        if isinstance(value, re.Pattern):
+            return Q("regexp", **{
+                'value' if key == 'md5' else 'infos.%s' % key: cls._get_pattern(value)
+            })
+        return Q("match", **{
+            'value' if key == 'md5' else 'infos.%s' % key: value
+        })
+
+    @classmethod
+    def searchja3client(cls, value_or_hash=None):
+        req = Q("match", **{"recontype": "SSL_CLIENT"})
+        req &= Q("match", **{"source": "ja3"})
+        if value_or_hash is not None:
+            req &= cls._searchja3(value_or_hash=value_or_hash)
+        return req
+        
+    
+    @classmethod
+    def searchja3server(cls, value_or_hash=None, client_value_or_hash=None):
+        req = Q("match", **{"recontype": "SSL_SERVER"})
+        if value_or_hash is not None:
+            req &= cls._searchja3(value_or_hash=value_or_hash)
+        if client_value_or_hash is None:
+            req &= Q("regexp", **{"source": "ja3-.*"})
+            return req
+        key, value = cls._ja3keyvalue(client_value_or_hash)
+        if key == 'md5':
+            req &= Q("match", **{"source": "ja3-%s" % value})
+            return req
+        req &= Q("regexp", **{"source": "ja3-.*"})
+        if isinstance(client_value_or_hash, re.Pattern):
+            req &= Q("regexp", **{
+                'infos.client.%s' % key: cls._get_pattern(client_value_or_hash)
+            })
+        else:
+            req &= Q("match", **{
+                'infos.client.%s' % key: client_value_or_hash
+            })
+        return req
+
+    
+    @staticmethod
+    def searchdns(name=None, reverse=False, dnstype=None, subdomains=False):
+        req = Q("match", **{"recontype": "DNS_ANSWER"})
+        # FIXME : TODO
+        if isinstance(name, list):
+            if len(name) == 1:
+                name = name[0]
+            else:
+                name = {'$in': name}
+        if name is not None:
+            raise ValueError("Unsupported")
+            res[
+                (('infos.domaintarget' if reverse else 'infos.domain')
+                 if subdomains else ('targetval' if reverse else 'value'))
+            ] = name
+        if dnstype is not None:
+            raise ValueError("Unsupported")
+            res['source'] = re.compile('^%s-' % dnstype.upper())
+        return req
+
+    def topvalues(self, field, flt=None, distinct=True, topnbr=None, **kwargs):
+        if flt is None:
+            flt = self.flt_empty
+        if field is None:
+            return []
+        elif field == 'domains':
+            flt &= self.searchdns()
+            field = 'infos.domain'
+        elif field.startswith("domains:"):
+            utils.LOGGER.warn("level domains not working yet.")
+            flt &= self.searchdns()
+            level = int(field[8:]) - 1
+            field = 'infos.domain'
+            # FIXME : regexp correcte, mais ne semble pas filtrer les domaines...
+            flt &= Q("regexp", **{field: "([^\\.]+\\.){%d}[^\\.]+" % level})
+        if not distinct:
+            return self._topvalues_sum(field, flt=flt, topnbr=topnbr)
+        return self._topvalues_distinct(field, flt=flt, topnbr=topnbr)
+    
+    def _topvalues_distinct(self, field, flt=None, topnbr=None):
+        req = Search().using(self.db_client)
+        agg = None
+        if flt is not None:
+            req = req.query(flt)
+        # We rely on default descending order
+        req.aggs.bucket("field_count", A("terms", field=field))
+        rep = req.execute()
+        if topnbr is not None:
+            return ({ "count": elt["doc_count"], "_id": elt["key"] }
+                    for elt in rep.aggregations["field_count"][:topnbr])
+        return ({ "count": elt["doc_count"], "_id": elt["key"] }
+                for elt in rep.aggregations["field_count"])
+
+    def _topvalues_sum(self, field, flt=None, topnbr=None):
+        req = Search().using(self.db_client)
+        agg = None
+        if flt is not None:
+            req = req.query(flt)
+        req.aggs.bucket("field_count", "terms", field=field, order={"field_sum": "desc"})\
+                .metric("field_sum", "sum", field="count")
+        rep = req.execute()
+        if topnbr is not None:
+            return ({ "count": elt["field_sum"]["value"], "_id": elt["key"] }
+                for elt in rep.aggregations["field_count"][:topnbr])
+        return ({ "count": elt["field_sum"]["value"], "_id": elt["key"] }
+                for elt in rep.aggregations["field_count"])
